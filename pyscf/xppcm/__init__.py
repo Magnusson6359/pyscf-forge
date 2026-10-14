@@ -1,6 +1,6 @@
-# pyscf-forge/pyscf/xp/__init__.py
+# pyscf-forge/pyscf/xppcm/__init__.py
 """
-XP module for pyscf-forge
+XP-PCM module for pyscf-forge
 """
 
 import importlib.util
