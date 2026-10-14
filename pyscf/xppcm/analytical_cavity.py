@@ -1,31 +1,35 @@
+import warnings
 import numpy as np
-from pyscf import gto
 from scipy.spatial import HalfspaceIntersection, ConvexHull, QhullError
 from scipy.optimize import linprog
 
-def get_cavity_volume(mol, radii_table):
+def union_of_spheres_volume(coords, radii):
     """
-    Exact analytical volume of the van der Waals cavity using a decomposition
-    via power diagrams. Based on (but not exactly following) the approach of 
-    Cazals et al., Computing the volume of a union of balls: A certified algorithm.
-    ACM Trans. Math. Softw. 38, 3:1-3:20 (2011).
+    Exact analytical volume of a union of spheres (the van der Waals cavity)
+    using a decomposition via power diagrams. Based on (but not exactly
+    following) the approach of Cazals et al., Computing the volume of a union
+    of balls: A certified algorithm. ACM Trans. Math. Softw. 38, 3:1-3:20 (2011).
 
     Parameters
     ----------
-    mol : gto.Mole
-        PySCF molecule object.
-    radii_table : array
-        Table of van der Waals radii for each atomic species.
-        
+    coords : array, shape (n, 3)
+        Sphere centres (Bohr).
+    radii : array, shape (n,)
+        Sphere radii (Bohr), all positive.
+
     Returns
     -------
     float
-        Cavity volume in Bohr^3.
+        Volume in Bohr^3.
     """
-    coords = mol.atom_coords()
-    radii = _get_cavity_radii(mol, radii_table=radii_table)
-    radii = np.array(radii)
-    
+    coords = np.asarray(coords, dtype=float)
+    radii = np.asarray(radii, dtype=float).reshape(-1)
+    if coords.shape != (radii.size, 3):
+        raise ValueError(
+            f"coords must have shape ({radii.size}, 3) to match radii, got {coords.shape}.")
+    if np.any(radii <= 0.0):
+        raise ValueError("All radii must be positive.")
+
     total_volume = 0.0
     
     for i in range(len(coords)): # For each atom i:
@@ -98,7 +102,9 @@ def get_cavity_volume(mol, radii_table):
             # Spherical cap contribution
             # Motivation: The total solid angle of C_i is 4pi, so 4pi-omega_P_total is the solid angle of the (total) spherical cap.
             # "Everything not a planar face is a spherical cap"
-            is_center_inside = np.all(all_halfspaces[:, :3] @ c_i + all_halfspaces[:, 3] <= 1e-8)
+            # Normalised by norm_A so the tolerance is a real distance.
+            signed_dists = (all_halfspaces[:, :3] @ c_i + all_halfspaces[:, 3]) / norm_A
+            is_center_inside = np.all(signed_dists <= 1e-8)
             omega_S = (4.0 * np.pi if is_center_inside else 0.0) - omega_P_total
             area_S_exact = (r_i**2) * omega_S
             # Volume contribution from the spherical cap (generalised pyramid formula)
@@ -108,19 +114,12 @@ def get_cavity_volume(mol, radii_table):
             
         except QhullError as e:
             # Almost empty or degenerate cell, skip this atom
-            print(f"Warning: HalfspaceIntersection failed for atom {i}: {e}")
+            warnings.warn(
+                f"HalfspaceIntersection failed for atom {i}; its cell is skipped: {e}",
+                RuntimeWarning, stacklevel=2)
             continue
 
     return total_volume
-
-def _get_cavity_radii(mol, radii_table):
-    """
-    Resolve cavity radii in Bohr as a per-atom array.
-    """
-    return np.array([
-        radii_table[gto.charge(mol.atom_symbol(i))]
-        for i in range(mol.natm)
-    ], dtype=float)
 
 def _solid_angle_triangle(R1, R2, R3):
     """
@@ -170,7 +169,7 @@ def _segment_circle_intersection_area_and_solid_angle(A, B, R, h, r_i):
         
         mid = (p1 + p2) / 2
         
-        if np.linalg.norm(mid) <= R + 1e-8:
+        if np.linalg.norm(mid) <= R:
             # Segment is inside the circle: triangle area via shoelace formula
             area += 0.5 * (p1[0]*p2[1] - p1[1]*p2[0])
             R1 = np.array([0, 0, h])
@@ -183,9 +182,7 @@ def _segment_circle_intersection_area_and_solid_angle(A, B, R, h, r_i):
             theta2 = np.arctan2(p2[1], p2[0])
             d_theta = (theta2 - theta1 + np.pi) % (2*np.pi) - np.pi
             area += 0.5 * R**2 * d_theta
-            if not np.isclose(h, 0):
-                omega += d_theta * (np.sign(h) - h / r_i)
-            # if h == 0, omega contribution is 0.0
+            omega += d_theta * (np.sign(h) - h / r_i)
             
     return area, omega
 
@@ -204,7 +201,12 @@ def _polygon_circle_intersection_area_and_solid_angle(verts_2d, R, h, r_i):
         area_total += a
         omega_total += o
         
-    return abs(area_total), omega_total
+    # The vertices run counter-clockwise in the (u, v) frame, so area_total comes
+    # out positive. The solid angle carries that same orientation, so should the
+    # sign ever flip, both must flip together.
+    if area_total < 0.0:
+        return -area_total, -omega_total
+    return area_total, omega_total
 
 def _extract_planar_faces(convex_polyhedrons, tol=1e-8):
     """
@@ -214,9 +216,23 @@ def _extract_planar_faces(convex_polyhedrons, tol=1e-8):
     halfspaces = convex_polyhedrons.halfspaces # radical planes + bounding box planes
     
     faces = []
+    seen = [] # Planes already made into a face, so none is counted twice
     for h in halfspaces:
+        h_norm = np.linalg.norm(h[:3])
+        if h_norm <= 0.0:
+            continue # Degenerate halfspace, defines no plane
+        
+        normal = h[:3] / h_norm
+        d = h[3] / h_norm
+        
+        # Check if this plane has already been processed (within tolerance)
+        if any(np.abs(normal - n_prev).max() <= tol and abs(d - d_prev) <= tol
+               for n_prev, d_prev in seen):
+            continue
+        seen.append((normal, d))
+        
         # Check distance of all vertices to radical plane
-        dists = np.dot(vertices, h[:3]) + h[3]
+        dists = np.dot(vertices, normal) + d
         
         # Vertices lying on the plane
         on_plane_idx = np.where(np.abs(dists) <= tol)[0]
@@ -225,19 +241,21 @@ def _extract_planar_faces(convex_polyhedrons, tol=1e-8):
             face_verts = vertices[on_plane_idx]
             
             # Order the vertices in the plane of the face by projecting to 2D and using Convex Hull
-            normal = h[:3] / np.linalg.norm(h[:3])
             u, v = _get_orthogonal_basis_for_plane(normal)
 
             # Project vertices
             proj_2d = np.vstack([np.dot(face_verts, u), np.dot(face_verts, v)]).T
 
             # Sort via 2D Convex Hull
-            hull_2d = ConvexHull(proj_2d)
+            try:
+                hull_2d = ConvexHull(proj_2d)
+            except QhullError:
+                continue # Degenerate (e.g. collinear) face, contributes no area
             ordered_verts = face_verts[hull_2d.vertices]
             
             faces.append({
                 'normal': normal,
-                'd': h[3] / np.linalg.norm(h[:3]),
+                'd': d,
                 'vertices': ordered_verts
             })
             
@@ -272,6 +290,13 @@ def _get_radical_planes(coords, radii, i):
         c_j_2 = np.dot(c_j, c_j)
         
         d = (c_i_2 - c_j_2) - (r_i**2 - r_j**2)
+
+        # Check if spheres are coincident or if the radical plane is degenerate
+        if np.linalg.norm(normal) <= 1e-12:
+            if (r_j > r_i) or (r_j == r_i and j < i):
+                return np.array([[0.0, 0.0, 0.0, 1.0]]) # Infeasible => C_i empty
+            continue # Sphere j constrains nothing
+
         # Format Ax + By + Cz + D <= 0 for HalfspaceIntersection  
         rad_planes.append([normal[0], normal[1], normal[2], d])
         

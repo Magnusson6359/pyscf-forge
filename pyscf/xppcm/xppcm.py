@@ -6,24 +6,25 @@ XPPCM module for PySCF.
 #  Public API
 # ---------------------------------------------------------------------------
 # XP, XPCav: main classes for XP-PCM and XP-PCM with cavitation energy
-#   - E_rep available via mf.with_xp.get_e_rep()
+#   - E_rep available via mf.get_e_rep()
 #   - E_cav available via mf.with_xp.get_e_cav() (XPCav only)
 #   - XPCav gradients available via mf.with_xp.nuc_grad_method()
 #   - Built via factory functions ks.XP(...) and ks.XPCav(...), which wrap standard SCF objects
 # get_z0, get_z, get_eps: helpers for calculating XP-PCM parameters from solvent properties
 # calculate_fitted_pressure: fit E(V) to an equation of state and compute pressure
 # calculate_numerical_pressure: compute pressure by numerical differentiation of E(V)
-# calculate_analytical_pressure: compute pressure analytically 
-# get_cavity_volume_grid: compute cavity volume via grid integration (numerical, slow)
-# get_cavity_volume_atom: compute cavity volume for a single atom (analytical, fastest)
-# get_cavity_volume: compute cavity volume (analytical, fast)
+# calculate_analytical_pressure: compute pressure analytically
+# get_cavity_volume_atom: compute cavity volume for a single atom
+# get_cavity_volume: compute cavity volume
 
 import numpy as np
 import warnings
 from scipy.optimize import curve_fit
-from pyscf import lib, dft, gto, ci, cc
+from pyscf import lib, scf, dft, gto, ci, cc, mcscf, fci
 from pyscf.data import radii
-from pyscf.dft.gen_grid import MakeAngularGrid, LEBEDEV_ORDER
+from pyscf.dft.gen_grid import MakeAngularGrid, LEBEDEV_ORDER, _default_ang, _default_rad, get_partition
+from .pcm_derivatives import get_pcm_obj, pol_derivatives
+from .analytical_cavity import union_of_spheres_volume
 
 # AU pressure conversion factor: 1 Eh/Bohr^3 = 29421.015798 GPa
 EH_BOHR3_TO_GPA = 29421.015798
@@ -55,50 +56,56 @@ def get_z0(solvent_num_valence_elec, solvent_density, solvent_molar_mass):
     float
         Semi-empirical barrier height / implicit electron density in atomic units.
     """
+    # n_val * rho / M is the solvent valence-electron density in mol e-/cm^3;
+    # 0.063 is the semi-empirical proportionality constant of the XP-PCM
+    # parametrisation that maps it onto the barrier height z0 (a.u.).
     return (solvent_num_valence_elec * solvent_density / solvent_molar_mass) * 0.063
 
-def get_z(f_vdw, f_vdw_0, z0, eta=6):
+def get_z(volume, volume_0, z0, eta=6):
     """
-    Calculate the barrier height z at a given cavity scaling factor.
+    Calculate the barrier height z at a given cavity volume.
+
+    z = z0 * s^-(3 + eta) with s = (V_c / V_c^0)^(1/3), i.e. eq 9 of
+    Cammi, Chen & Rahm (2018): z = z0 * (V_c / V_c^0)^(-(3 + eta)/3).
 
     Parameters
     ----------
-    f_vdw : float
-        Current scaling factor.
-    f_vdw_0 : float
-        Reference (equilibrium) scaling factor.
+    volume : float or array
+        Cavity volume at the current compression (Bohr^3, atomic units).
+    volume_0 : float
+        Reference (ambient-pressure) cavity volume (Bohr^3, atomic units).
     z0 : float
-        Barrier height at f_vdw_0.
+        Barrier height at volume_0.
     eta : int, default 6
         Repulsive exponent.
 
     Returns
     -------
-    float
+    float or array
         Semi-empirical barrier height / implicit electron density in atomic units.
     """
-    return z0 * (f_vdw / f_vdw_0) ** -(3 + eta)
+    return z0 * _get_scaling_factor(volume, volume_0) ** -(3 + eta)
 
-def get_eps(f_vdw, f_vdw_0, eps_0):
+def get_eps(volume, volume_0, eps_0):
     """
-    Calculate the dielectric constant at a given cavity scaling factor.
-    Theoretically sound for non-polar solvents.
+    Calculate the dielectric constant at a given cavity volume.
 
     Parameters
     ----------
-    f_vdw : float
-        Current scaling factor.
-    f_vdw_0 : float
-        Reference scaling factor.
+    volume : float or array
+        Cavity volume at the current compression (Bohr^3, atomic units).
+    volume_0 : float
+        Reference (ambient-pressure) cavity volume (Bohr^3, atomic units).
     eps_0 : float
-        Dielectric constant at f_vdw_0.
+        Dielectric constant at volume_0 (ambient value of the medium at the
+        working temperature).
 
     Returns
     -------
-    float
+    float or array
         Dielectric constant.
     """
-    return 1 + (eps_0 - 1) * (f_vdw / f_vdw_0) ** -3
+    return 1 + (eps_0 - 1) * _get_scaling_factor(volume, volume_0) ** -3
 
 def calculate_fitted_pressure(energies, volumes):
     """
@@ -126,7 +133,14 @@ def calculate_fitted_pressure(energies, volumes):
     x_data = volumes / volumes[0]
     y_data = energies - energies[0]
 
-    popt, _ = curve_fit(_eos, x_data, y_data)
+    try:
+        popt, _ = curve_fit(_eos, x_data, y_data, maxfev=20000)
+    except RuntimeError as e:
+        raise RuntimeError(
+            "calculate_fitted_pressure: the equation-of-state fit did not converge. "
+            "Check that energies and volumes are ordered consistently and that E(V) "
+            "is smooth (no electronic transition); otherwise use "
+            "calculate_numerical_pressure.") from e
     a_fit, b_fit, c_fit = popt
 
     a = a_fit / volumes[0]
@@ -139,8 +153,7 @@ def calculate_fitted_pressure(energies, volumes):
 def calculate_numerical_pressure(energies, volumes):
     """
     Calculate pressure by numerical differentiation of E(V).
-    If repulsion energy is included, a high number of radial grid points is strongly recommended.
-    (at least 1000 radial grid points for smooth curves)
+    Central differences in the interior, one-sided (first-order) differences at the two end points.
 
     Parameters
     ----------
@@ -169,84 +182,100 @@ def calculate_numerical_pressure(energies, volumes):
 
     return -pressure
 
-def calculate_analytical_pressure(method_obj, volume_cavity, eta=6, lebedev_order=29):
+def calculate_analytical_pressure(method_obj, volume_cavity, eta=6, lebedev_order=47,
+                                  polarisation=True, return_terms=False, dm=None):
     """
     Calculate pressure from the XP-PCM SCF analytical expression.
-    Cammi, R., Chen, B. & Rahm, M., 
-    Journal of Computational Chemistry 39, 2243–2250 (2018).
-    Does not include polarisation effects from PCM.
+    Cammi, R., Chen, B. & Rahm, M.,
+    Journal of Computational Chemistry 39, 2243-2250 (2018).
+
+        P_rep  = (3 + eta)/(3 V_c) * E_rep            from z scaling with volume
+        P_surf = z * <rho>_surface                    from the shrinking exterior
+
+    If a PySCF PCM solvent is attached, two further terms are added:
+
+        P_pol  = -dG_pol/dV_c = -(dG_pol/dlnf)/(dV_c/dlnf)  from a relative scaling of the cavity radii
+        P_eps  = (eps - 1)/V_c * dG_pol/deps          from the dielectric constant scaling with volume
 
     Parameters
     ----------
     method_obj : method object
-        either scf object with XP attached, or a post-HF object (e.g. CI, CC) with an _SCF attribute that has XP attached.
+        SCF object with XP attached, or a post-HF object (CISD, CCSD, CASCI,
+        CASSCF) whose _scf has XP attached. A PySCF PCM may be attached to
+        either with .PCM().
     volume_cavity : float
         Cavity volume (Bohr^3, atomic units).
     eta : float, default 6
         Repulsive exponent.
-    lebedev_order : int, default 29
-        Lebedev quadrature order for surface grids (29 = 302 points per sphere).
-    grid_level : int, default 3
-        Grid level for integration.
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points for integration. 
-        None = default PySCF radial grid for the given level.
+    lebedev_order : int, default 47
+        Lebedev quadrature order for surface grids (47 = 770 points per sphere).
+    polarisation : bool, default True
+        Include the PCM polarisation terms when a PCM solvent is attached.
+        Ignored if no PCM is attached.
+    return_terms : bool, default False
+        Return a dict of the individual contributions instead of just the total.
+    dm : array, optional
+        AO density matrix, (nao, nao) or (2, nao, nao), used instead of the one
+        from method_obj: e.g. a relaxed post-HF density, or the density of an
+        fci.FCI solver (then pass the XP SCF object as method_obj).
+
+    Notes
+    -----
+    Hellmann-Feynman derivative at fixed wavefunction: exact for variational
+    methods (SCF, FCI, CASSCF with self-consistent PCM). For CCSD, CISD, CASCI
+    and perturbation theories the unrelaxed density misses the orbital response.
 
     Returns
     -------
-    float
-        Pressure in GPa.
+    float or dict
+        Pressure in GPa. If return_terms is True, a dict with keys
+        'total', 'repulsion', 'surface', 'polarisation', 'dielectric' (all GPa).
     """
-    # Check if pcm is attached. If so, warn that the analytical pressure will not include polarisation effects.
-    if hasattr(method_obj, 'with_solvent'):
-        warnings.warn(
-            """
-            Analytical pressure calculation does not include polarisation effects from PCM.
-            If wished, it can be included in post via calculate_numerical_pressure by supplying 
-            the polarisation energy via .with_solvent.e.
-            """,
-            UserWarning,
-            stacklevel=2
-        )
-    
-    xp = method_obj.with_xp
+    post_hf = hasattr(method_obj, '_scf') # Post HF objects have an _scf attribute that contains the SCF object.
+    xp = getattr(method_obj, 'with_xp', None)
+    if xp is None and post_hf:
+        xp = getattr(method_obj._scf, 'with_xp', None)
+    if xp is None:
+        raise ValueError(
+            "calculate_analytical_pressure: no XP attached to method_obj "
+            "(or to its underlying SCF object). Build the reference with mf.XP(...).")
     z = xp.z
     radii_table = xp.radii_table
     mol = method_obj.mol
 
-    post_hf = hasattr(method_obj, '_scf') # Post HF objects have an _scf attribute that contains the SCF object.
-    if post_hf:
+    if dm is not None:
+        dm_tot = _as_total_dm(dm)
+    elif post_hf:
         dm_tot = _get_post_hf_dm_tot(method_obj)
     else: # SCF method with XP attached directly
-        dm = method_obj.make_rdm1()
-        dm_tot = dm[0] + dm[1] if np.shape(dm)[0] == 2 else dm
-    
+        dm_tot = _as_total_dm(method_obj.make_rdm1())
+
     # Term 1: Repulsive energy contribution
-    e_rep = method_obj.with_xp.get_e_rep(dm_tot, mol=mol)
+    e_rep = xp.get_e_rep(dm_tot, mol=mol)
     term1 = ((3.0 + eta) / (3.0 * volume_cavity)) * e_rep
 
     # Term 2: Surface electron density contribution
     surface_data = _get_cavity_surface_grid(
-        mol, radii_table=radii_table,
-        lebedev_order=lebedev_order)
+        mol, radii_table, lebedev_order=lebedev_order)
 
-    numerator_surfint = 0.0   # Σ_i Σ_exposed(w_l * ρ_l)
-    denominator_surfint = 0.0 # Σ_i Σ_exposed(w_l)
+    numerator_surfint = 0.0   # Σ_A R_A^3 Σ_exposed(w_l * ρ_l)
+    denominator_surfint = 0.0 # Σ_A R_A^3 Σ_exposed(w_l)
 
     for atom in range(mol.natm):
         sd = surface_data[atom]
         w = sd['weights']
-        
+        r3 = sd['radius'] ** 3
+
         if len(sd['coords']) > 0:
             # Evaluate electron density ρ(r) = Σ_μν P_μν φ_μ(r) φ_ν(r)
             ao_surf = dft.numint.eval_ao(mol, sd['coords'], deriv=0)
             rho_surf = np.einsum('gi,ij,gj->g', ao_surf, dm_tot, ao_surf)
-            
-            # Σ_exposed(w_l * ρ_l)
-            numerator_surfint += np.sum(w * rho_surf)
-            
-            # Σ_exposed(w_l)
-            denominator_surfint += np.sum(w)
+
+            # Σ_A R_A^3 Σ_exposed(w_l * ρ_l)
+            numerator_surfint += r3 * np.sum(w * rho_surf)
+
+            # Σ_A R_A^3 Σ_exposed(w_l)
+            denominator_surfint += r3 * np.sum(w)
 
     # Compute weighted surface density
     if denominator_surfint > 1e-14:
@@ -254,40 +283,48 @@ def calculate_analytical_pressure(method_obj, volume_cavity, eta=6, lebedev_orde
     else:
         term2 = 0.0
 
-    p_gpa = (term1 + term2) * EH_BOHR3_TO_GPA
+    # dV_c/dlnf = 4 pi sum_A R_A^3 sum_l w_l: the volume derivative with respect to a
+    # relative scaling of the current radii (article: dV_c/df = 4 pi f^2 sum r_A^3 w_l,
+    # i.e. this divided by f). The polarisation derivatives use the same convention.
+    dvc_dlnf = 4.0 * np.pi * denominator_surfint
+
+    # Terms 3 and 4: PCM polarisation contributions
+    term3 = term4 = 0.0
+    pcmobj = get_pcm_obj(method_obj)
+    if pcmobj is not None:
+        # polarisation=False is an explicit opt-out, so it passes without comment
+        if polarisation:
+            term3, term4 = _polarisation_pressure_terms(
+                pcmobj, dm_tot, volume_cavity, dvc_dlnf)
+    else:
+        # A non-PCM solvent model (ddCOSMO, ddPCM) may be attached, on the
+        # object itself or (post-HF) on the underlying SCF object; no
+        # analytical polarisation derivative is available for it.
+        solvent = getattr(method_obj, 'with_solvent', None)
+        if solvent is None and post_hf:
+            solvent = getattr(method_obj._scf, 'with_solvent', None)
+        if solvent is not None:
+            warnings.warn(
+                f"Analytical pressure calculation does not include polarisation "
+                f"effects from the attached "
+                f"{solvent.__class__.__name__} solvent model; only "
+                f"PySCF's switching/Gaussian PCM is supported.",
+                UserWarning,
+                stacklevel=2
+            )
+
+    if return_terms:
+        return {
+            'total':        (term1 + term2 + term3 + term4) * EH_BOHR3_TO_GPA,
+            'repulsion':    term1 * EH_BOHR3_TO_GPA,
+            'surface':      term2 * EH_BOHR3_TO_GPA,
+            'polarisation': term3 * EH_BOHR3_TO_GPA,
+            'dielectric':   term4 * EH_BOHR3_TO_GPA,
+        }
+
+    p_gpa = (term1 + term2 + term3 + term4) * EH_BOHR3_TO_GPA
 
     return p_gpa
-
-def get_cavity_volume_grid(mol, radii_table, grid_level=3, radial_grid_pts=2000):
-    """
-    Volume of the van der Waals cavity, computed via grid integration.
-
-    Parameters
-    ----------
-    mol : gto.Mole
-        Molecule object.
-    radii_table : array
-        Table of van der Waals radii for each atomic species.
-    grid_level : int, default 3
-        PySCF grid level for integration (default: 3).
-    radial_grid_pts : int or None, default 2000
-        Number of radial grid points. If None, use standard PySCF radial grid for the given level.
-
-    Returns
-    -------
-    float
-        Volume in Bohr^3.
-    """
-    coords, weights = _build_grid(mol, grid_level, radial_grid_pts=radial_grid_pts)
-    atom_coords = mol.atom_coords()
-    radii_list = _get_cavity_radii(mol, radii_table=radii_table)
-
-    diff = coords[None, :, :] - atom_coords[:, None, :]    # (natm, ngrid, 3)
-    dist2 = np.einsum('aig,aig->ai', diff, diff)           # (natm, ngrid)
-    radii2 = np.array(radii_list)[:, None] ** 2
-    inside_any = (dist2 <= radii2).any(axis=0)              # (ngrid,)
-    vol = np.sum(weights[inside_any])
-    return vol
 
 def get_cavity_volume_atom(mol, radii_table):
     """
@@ -299,7 +336,7 @@ def get_cavity_volume_atom(mol, radii_table):
     mol : gto.Mole
         Molecule object. Must contain exactly one atom.
     radii_table : array
-        Table of van der Waals radii for each atomic species.
+        Cavity radii in Bohr, indexed by nuclear charge.
 
     Returns
     -------
@@ -308,14 +345,64 @@ def get_cavity_volume_atom(mol, radii_table):
     """
     if mol.natm != 1:
         raise ValueError("get_cavity_volume_atom is only valid for single-atom molecules.")
-    R = _get_cavity_radii(mol, radii_table=radii_table)[0]
+    R = _get_cavity_radii(mol, radii_table)[0]
     return (4.0 / 3.0) * np.pi * R ** 3
 
-from .analytical_cavity import get_cavity_volume # Analytical cavity volume
+def get_cavity_volume(mol, radii_table):
+    """
+    Exact analytical volume of the van der Waals cavity (union of the atomic spheres).
+
+    Parameters
+    ----------
+    mol : gto.Mole
+        Molecule object.
+    radii_table : array
+        Cavity radii in Bohr, indexed by nuclear charge.
+
+    Returns
+    -------
+    float
+        Volume in Bohr^3.
+    """
+    radii_arr = _get_cavity_radii(mol, radii_table)
+    return union_of_spheres_volume(mol.atom_coords(), radii_arr)
 
 # ---------------------------------------------------------------------------
 #  Internal helpers
 # ---------------------------------------------------------------------------
+
+def _get_scaling_factor(volume, volume_0):
+    """
+    Effective cavity scaling factor s = (V_c / V_c^0)^(1/3).
+
+    Parameters
+    ----------
+    volume : float or array
+        Cavity volume at the current compression (Bohr^3, atomic units).
+    volume_0 : float
+        Reference (ambient-pressure) cavity volume (Bohr^3, atomic units).
+
+    Returns
+    -------
+    float or array
+        Scaling factor s.
+    """
+    return (np.asarray(volume, dtype=float) / volume_0) ** (1.0 / 3.0)
+
+def _as_total_dm(dm):
+    """
+    Collapse a density matrix to the total (alpha+beta) AO density.
+
+    Parameters
+    ----------
+    dm : array, shape (nao, nao) or (2, nao, nao)
+
+    Returns
+    -------
+    array, shape (nao, nao)
+    """
+    dm = np.asarray(dm)
+    return dm[0] + dm[1] if dm.ndim == 3 else dm
 
 def _get_cavity_radii(mol, radii_table):
     """
@@ -326,101 +413,104 @@ def _get_cavity_radii(mol, radii_table):
     mol : gto.Mole
         Molecule object.
     radii_table : array
-        Table of van der Waals radii for each atomic species.
+        Cavity radii in Bohr, indexed by nuclear charge.
 
     Returns
     -------
-    array
-        Array of cavity radii in Bohr.
+    array, shape (natm,)
+        Cavity radius of each atom in Bohr.
     """
     return np.array([
         radii_table[gto.charge(mol.atom_symbol(i))]
         for i in range(mol.natm)
     ], dtype=float)
 
-def _build_grid(mol, grid_level, radial_grid_pts=1000):
+class _PerAtomKeys:
     """
-    Build a PySCF grid for evaluation of XP-PCM integrals.
-    Note: radial grid increase per default only acts on the XP-PCM integrals, 
-    not on the DFT part if using with a DFT functional. 
-    This is to avoid unnecessarily increasing the cost of the DFT part, 
-    while ensuring smooth XP-PCM energies and pressures. 
-    If wished, the radial grid for the DFT part can be increased by setting 
-    mf.grids.radial_grid = radial_grid_pts when using with a DFT functional.
-    
-    Parameters
-    ----------
-    mol : gto.Mole
-    grid_level : int
-        PySCF grid level for integration (default: 3).
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use standard PySCF radial grid for the given level.
-
-    Returns
-    -------
-    coords : array, shape (ngrid, 3)
-        Grid coordinates in Bohr.
-    weights : array, shape (ngrid,)
-        Grid weights.
+    Mole proxy for ``dft.gen_grid.get_partition`` whose ``atom_symbol(ia)``
+    returns the atom index, so an ``atom_grids_tab`` can hold one atomic grid
+    per atom.
     """
-    from pyscf.dft.gen_grid import _default_ang
-    
-    grid = dft.gen_grid.Grids(mol)
-    
-    if radial_grid_pts is not None:
-        # Use custom radial grid with angular points from the specified level
-        atom_grid = {}
-        for ia in range(mol.natm):
-            symb = mol.atom_symbol(ia)
-            if symb not in atom_grid:
-                chg = gto.charge(symb)
-                n_ang = _default_ang(chg, level=grid_level)
-                atom_grid[symb] = (radial_grid_pts, n_ang)
-        grid.atom_grid = atom_grid
-    else:
-        # Use standard PySCF grid for the specified level
-        grid.level = grid_level
 
-    grid.radi_method = dft.radi.delley
-    grid.build(with_non0tab=False)
-    return grid.coords.copy(), grid.weights.copy()
+    def __init__(self, mol):
+        self._mol = mol
 
-def _get_confined_grid(mol, radii_table, grid_level=3, radial_grid_pts=1000):
+    def __getattr__(self, name):
+        return getattr(self._mol, name)
+
+    def atom_symbol(self, ia):
+        return ia
+
+def _build_grid(mol, radii_table, grid_level=3):
     """
-    Build a grid and mask out points inside the cavity to get the confined (exterior) grid.
+    Build the exterior grid for the XP-PCM integrals: all points outside the
+    molecular cavity.
+
+    Each atom's radial shells (Treutler-Ahlrichs) start at that
+    atom's cavity radius, and the atoms are joined by Becke weights.
+    Points that fall inside another atom's sphere are removed. Angular pruning is not applied. 
+    This grid is used only for the XP-PCM integrals, not for the DFT part when using a DFT functional.
+    # TODO: Radius fitting support in the future!
 
     Parameters
     ----------
     mol : gto.Mole
         Molecule object.
     radii_table : array
-        Table of van der Waals radii for each atomic species.
+        Cavity radii in Bohr, indexed by nuclear charge.
     grid_level : int, default 3
         PySCF grid level for integration (default: 3).
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use standard PySCF radial grid for the given level.
 
     Returns
     -------
-    coords : array, shape (ngrid, 3)
-        Grid coordinates in Bohr.
-    weights : array, shape (ngrid,)
-        Grid weights.
+    coords : array, shape (ngrid_out, 3)
+        Grid coordinates in Bohr, exterior points only.
+    weights : array, shape (ngrid_out,)
+        Grid weights, exterior points only.
     """
-    coords, weights = _build_grid(mol, grid_level, radial_grid_pts=radial_grid_pts)
 
+    radii = _get_cavity_radii(mol, radii_table)
+
+    atom_grids_tab = {}
+    for ia in range(mol.natm):
+        chg = gto.charge(mol.atom_symbol(ia))
+        n_rad = _default_rad(chg, grid_level)
+        n_ang = _default_ang(chg, level=grid_level)
+        rad, dr = dft.radi.treutler_ahlrichs(n_rad, chg)
+        rad = rad + radii[ia]
+        ang = MakeAngularGrid(n_ang)                      # (n_ang, 4): x, y, z, w
+        coords = np.einsum('i,jk->ijk', rad, ang[:, :3]).reshape(-1, 3)
+        vol = np.einsum('i,j->ij', 4.0 * np.pi * rad**2 * dr, ang[:, 3]).ravel()
+        atom_grids_tab[ia] = (coords, vol)
+    defaults = dft.gen_grid.Grids(mol)   # PySCF's Becke partition settings
+    coords, weights = get_partition(
+        _PerAtomKeys(mol), atom_grids_tab,
+        defaults.radii_adjust, defaults.atomic_radii, defaults.becke_scheme)
+
+    # Hard cut at the cavity surface. An atom's own shells start at its radius,
+    # but shells of other atoms cross this sphere and their points switch in and
+    # out as the nuclei move, so the energy is only piecewise smooth in the
+    # nuclear coordinates (noise ~1e-6 Eh at grid_level 3 for z ~ 0.3). The
+    # analytical gradient is the continuum limit and is unaffected. See XPCav().
     atom_coords = mol.atom_coords()
-    radii_list = _get_cavity_radii(mol, radii_table=radii_table)
     inside = np.zeros(len(coords), dtype=bool)
-    for idx in range(mol.natm):
-        R = radii_list[idx]
-        dist = np.linalg.norm(coords - atom_coords[idx], axis=1)
-        inside |= (dist <= R)
+    for ia in range(mol.natm):
+        dist = np.linalg.norm(coords - atom_coords[ia], axis=1)
+        inside |= (dist <= radii[ia])
+    outside = ~inside
+    return coords[outside], weights[outside]
 
-    weights[inside] = 0.0
-    return coords, weights
+def _xp_grid_blksize(mol, max_memory_mb=None):
+    """
+    Grid points per block for the exterior integrals, such that one (nblk, nao)
+    AO array takes about a third of the remaining memory budget (PySCF
+    convention: mol.max_memory minus current usage, floored at a minimum block).
+    """
+    if max_memory_mb is None:
+        max_memory_mb = max(mol.max_memory - lib.current_memory()[0], 0)
+    return int(max(2000, max_memory_mb * 1e6 / 3 / 8 / max(mol.nao, 1)))
 
-def _get_S_out(mol, radii_table, grid_level=3, radial_grid_pts=1000):
+def _get_S_out(mol, radii_table, grid_level=3):
     """
     Overlap matrix S_out evaluated on the confined (exterior) grid.
 
@@ -429,27 +519,23 @@ def _get_S_out(mol, radii_table, grid_level=3, radial_grid_pts=1000):
     mol : gto.Mole
         Molecule object.
     radii_table : array
-        Table of van der Waals radii for each atomic species.
+        Cavity radii in Bohr, indexed by nuclear charge.
     grid_level : int, default 3
         PySCF grid level for integration (default: 3).
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use standard PySCF radial grid for the given level.
-        Per-atom van der Waals radii. Must provide one of radii_table or per_atom_radii.
 
     Returns
     -------
     array, shape (nao, nao)
         Overlap matrix in the AO basis outside the cavity.
     """
-    coords, weights = _get_confined_grid(
-        mol, radii_table=radii_table,
-        grid_level=grid_level, radial_grid_pts=radial_grid_pts)
-    ao = dft.numint.eval_ao(mol, coords, deriv=0)
-    weighted_ao = ao * weights[:, np.newaxis]
-    return ao.T @ weighted_ao
+    coords, weights = _build_grid(mol, radii_table, grid_level=grid_level)
+    S_out = np.zeros((mol.nao, mol.nao))
+    for p0, p1 in lib.prange(0, len(weights), _xp_grid_blksize(mol)):
+        ao = dft.numint.eval_ao(mol, coords[p0:p1], deriv=0)
+        S_out += ao.T @ (ao * weights[p0:p1, np.newaxis])
+    return S_out
 
-def _get_S_out_nuc_grad(mol, dm, radii_table,
-                        grid_level=3, radial_grid_pts=1000):
+def _get_S_out_nuc_grad(mol, dm, radii_table, grid_level=3):
     """
     Analytical nuclear gradient of S_out w.r.t. nuclear coordinates.
 
@@ -460,27 +546,24 @@ def _get_S_out_nuc_grad(mol, dm, radii_table,
     dm : array, shape (nao, nao)
         Density matrix in the AO basis.
     radii_table : array
-        Table of van der Waals radii for each atomic species.
+        Cavity radii in Bohr, indexed by nuclear charge.
     grid_level : int, default 3
         PySCF grid level for integration (default: 3).
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use standard PySCF radial grid for the given level.
 
     Returns
     -------
     array, shape (natm, 3)
         In atomic units (Bohr^-1).
     """
-    coords, weights = _get_confined_grid(
-        mol, radii_table=radii_table,
-        grid_level=grid_level, radial_grid_pts=radial_grid_pts)
+    coords, weights = _build_grid(mol, radii_table, grid_level=grid_level)
 
-    ao_all = dft.numint.eval_ao(mol, coords, deriv=1)
-    ao  = ao_all[0]        # (ngrid, nao)
-    dao = ao_all[1:4]      # (3, ngrid, nao)
-
-    Vphi = (ao * weights[:, np.newaxis]) @ dm   # (ngrid, nao)
-    contrib = np.einsum('kgm,gm->km', dao, Vphi)  # (3, nao)
+    contrib = np.zeros((3, mol.nao))
+    for p0, p1 in lib.prange(0, len(weights), _xp_grid_blksize(mol) // 4):   # deriv=1: 4 AO arrays
+        ao_all = dft.numint.eval_ao(mol, coords[p0:p1], deriv=1)
+        ao  = ao_all[0]        # (nblk, nao)
+        dao = ao_all[1:4]      # (3, nblk, nao)
+        Vphi = (ao * weights[p0:p1, np.newaxis]) @ dm        # (nblk, nao)
+        contrib += np.einsum('kgm,gm->km', dao, Vphi)        # (3, nao)
 
     grad = np.zeros((mol.natm, 3))
     ao_slices = mol.aoslice_by_atom()
@@ -489,7 +572,7 @@ def _get_S_out_nuc_grad(mol, dm, radii_table,
         grad[A, :] = -2.0 * contrib[:, p0:p1].sum(axis=1)
     return grad
 
-def _get_cavity_surface_grid(mol, radii_table, lebedev_order=29):
+def _get_cavity_surface_grid(mol, radii_table, lebedev_order=47):
     """
     Exposed Lebedev surface grid on each atom's cavity sphere.
     Parameters
@@ -497,8 +580,8 @@ def _get_cavity_surface_grid(mol, radii_table, lebedev_order=29):
     mol : gto.Mole
         Molecule object.
     radii_table : array
-        Table of van der Waals radii for each atomic species.
-    lebedev_order : int, default 29
+        Cavity radii in Bohr, indexed by nuclear charge.
+    lebedev_order : int, default 47
         Order of the Lebedev grid.
 
     Returns
@@ -507,7 +590,7 @@ def _get_cavity_surface_grid(mol, radii_table, lebedev_order=29):
         One dict per atom with keys 'coords', 'normals', 'weights', 'radius'.
     """
     atom_coords = mol.atom_coords()                          # (natm, 3) Bohr
-    cavity_radii = _get_cavity_radii(mol, radii_table=radii_table)
+    cavity_radii = _get_cavity_radii(mol, radii_table)
 
     npts  = LEBEDEV_ORDER[lebedev_order]
     grid  = MakeAngularGrid(npts)          # (m, 4): x, y, z, w  (w sums to 1)
@@ -535,6 +618,37 @@ def _get_cavity_surface_grid(mol, radii_table, lebedev_order=29):
 
     return surface_data
 
+def _polarisation_pressure_terms(pcmobj, dm_tot, volume_cavity, dvc_dlnf):
+    """
+    The two polarisation pressure contributions in Eh/Bohr^3 (not yet in GPa).
+
+    ``dvc_dlnf`` is the exact dV_c/dlnf from the cavity surface grid, the
+    derivative with respect to a relative scaling of the current radii.
+    pol_derivatives returns dG_pol/dlnf in the same convention, so the ratio
+    is dG_pol/dV_c regardless of the absolute scaling factor f.
+
+    Returns
+    -------
+    tuple of float
+        (P_pol, P_eps): the cavity-scaling and dielectric-scaling terms.
+    """
+    dG_dlnf, dG_deps = pol_derivatives(pcmobj, dm_tot)
+
+    if dvc_dlnf > 1e-14:
+        p_pol = -dG_dlnf / dvc_dlnf
+    else:
+        p_pol = 0.0
+
+    # eps(V_c) = 1 + (eps_0 - 1) V_c^0 / V_c (the get_eps law), so
+    # deps/dV_c = -(eps_0 - 1) V_c^0 / V_c^2 = -(eps - 1)/V_c.
+    # A Clausius-Mossotti law would give -(eps - 1)(eps + 2)/(3 V_c) instead
+    # (More accurate for non-polar media but diverges for polar)
+    if pcmobj.eps == float('inf'):
+        p_eps = 0.0     # f_epsilon is pinned at 1, so dG_pol/deps vanishes
+    else:
+        p_eps = (pcmobj.eps - 1.0) / volume_cavity * dG_deps
+    return p_pol, p_eps
+
 # ---------------------------------------------------------------------------
 #  XP (Pauli repulsion only)
 # ---------------------------------------------------------------------------
@@ -557,39 +671,46 @@ class _XP:
     ----------
     mol : gto.Mole
     z : float
-        Semi-empirical barrier height/Implicit electron density.
-    radii_table : ndarray, optional
+        Semi-empirical barrier height z (Hartree); see get_z0 and get_z.
+    radii_table : array
         Pre-scaled cavity radii in Bohr, indexed by nuclear charge.
-    per_atom_radii : list or ndarray, optional
-        Cavity radii in Bohr, indexed by atom index.
     grid_level : int, default 3
         PySCF grid level for XP overlap integrals.
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use grid_level default.
     """
 
-    def __init__(self, mol, z, radii_table, grid_level=3, radial_grid_pts=1000):
+    def __init__(self, mol, z, radii_table, grid_level=3):
         self.mol = mol
         self.z = z
         self.radii_table = radii_table
         self.grid_level = int(grid_level)
-        self.radial_grid_pts = radial_grid_pts
+
+    def reset(self, mol=None):
+        """
+        Point this object at a new molecule.
+
+        Required because PySCF hands out a *new* Mole in several paths — most
+        importantly pyscf.geomopt, which optimises a copy of the molecule
+        (geomopt/geometric_solver.py: "To avoid overwriting method.mol"), and
+        grad.rhf.SCF_GradScanner, which calls set_geom_(..., inplace=False).
+        Without this, self.mol keeps the geometry it was constructed with and
+        every quantity computed from it (grad, get_e_cav) is silently evaluated
+        at the wrong geometry.
+        """
+        if mol is not None:
+            self.mol = mol
+        return self
 
     def get_h_rep(self, mol=None):
         """h_rep = z · S_out."""
-        mol = mol or self.mol
-        return _get_S_out(
-            mol, radii_table=self.radii_table, grid_level=self.grid_level, 
-            radial_grid_pts=self.radial_grid_pts) * self.z
+        mol = mol if mol is not None else self.mol
+        return _get_S_out(mol, self.radii_table, grid_level=self.grid_level) * self.z
 
     def get_e_rep(self, dm, mol=None):
         """E_rep = z · Tr[P · S_out].  Handles restricted and unrestricted densities."""
-        mol = mol or self.mol
-        dm_tot = dm[0] + dm[1] if np.shape(dm)[0] == 2 else dm
-        S_out = _get_S_out(
-            mol, radii_table=self.radii_table,
-            grid_level=self.grid_level, radial_grid_pts=self.radial_grid_pts)
-        return np.trace(dm_tot @ S_out) * self.z
+        mol = mol if mol is not None else self.mol
+        dm_tot = _as_total_dm(dm)
+        S_out = _get_S_out(mol, self.radii_table, grid_level=self.grid_level)
+        return np.einsum('ij,ji->', dm_tot, S_out) * self.z
 
 class _SCFWithXP:
     """
@@ -618,6 +739,11 @@ class _SCFWithXP:
         del obj.with_xp
         return obj
 
+    def reset(self, mol=None):
+        """Reset both the SCF object and the XP parameters to a new molecule."""
+        self.with_xp.reset(mol)
+        return super().reset(mol)
+
     def get_hcore(self, mol=None):
         return super().get_hcore(mol) + self.with_xp.get_h_rep(mol)
 
@@ -635,6 +761,12 @@ class _SCFWithXP:
 
     Gradients = nuc_grad_method
 
+    def Hessian(self):
+        raise NotImplementedError(
+            "Nuclear Hessians are not implemented for XP-PCM. Without this guard the "
+            "call would silently fall through to the vacuum SCF Hessian, which omits "
+            "every XP derivative term and returns a plausible-looking but wrong result.")
+
     def dump_flags(self, verbose=None):
         super().dump_flags(verbose)
         xp = self.with_xp
@@ -645,7 +777,7 @@ class _SCFWithXP:
         log.info('grid_level            = %d', xp.grid_level)
         return self
 
-def XP(mf, z, radii_table, grid_level=3, radial_grid_pts=1000):
+def XP(mf, z, radii_table, grid_level=3):
     """
     Attach XP (Pauli repulsion only) to an SCF method.
     
@@ -659,13 +791,11 @@ def XP(mf, z, radii_table, grid_level=3, radial_grid_pts=1000):
     mf : pyscf.scf.SCF
         SCF object to wrap.
     z : float
-        Semi-empirical barrier height.
-    radii_table : array, 
+        Semi-empirical barrier height z (Hartree); see get_z0 and get_z.
+    radii_table : array
         Pre-scaled cavity radii in Bohr, indexed by nuclear charge.
     grid_level : int, default 3
         PySCF grid level for XP integrals.
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use grid_level default.
     
     Returns
     -------
@@ -674,11 +804,9 @@ def XP(mf, z, radii_table, grid_level=3, radial_grid_pts=1000):
     if isinstance(mf, _SCFWithXP):
         raise ValueError(
             "Cannot attach XP to an object that already has XP.")
-    
-    with_xp = _XP(
-        mf.mol, z, radii_table=radii_table,
-        grid_level=grid_level, radial_grid_pts=radial_grid_pts)
-    
+
+    with_xp = _XP(mf.mol, z, radii_table, grid_level=grid_level)
+
     sol_mf = _SCFWithXP(mf, with_xp)
     name = 'XP' + mf.__class__.__name__
     return lib.set_class(sol_mf, (_SCFWithXP, mf.__class__), name)
@@ -702,50 +830,47 @@ class _XPCav(_XP):
     ----------
     mol : gto.Mole
     z : float
-        Semi-empirical barrier height/Implicit electron density.
+        Semi-empirical barrier height z (Hartree); see get_z0 and get_z.
     radii_table : array
         Pre-scaled cavity radii in Bohr, indexed by nuclear charge.
     p_gpa : float
         External pressure (GPa).
     grid_level : int, default 3
         PySCF grid level for volume and overlap integrals.
-    lebedev_order : int, default 29
-        Lebedev quadrature order for surface integrals (→ 302 points).
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use grid_level default.
+    lebedev_order : int, default 47
+        Lebedev quadrature order for surface integrals (→ 770 points).
     """
 
-    def __init__(self, mol, z, radii_table=None,
-                 p_gpa=None, grid_level=3, lebedev_order=29, radial_grid_pts=1000):
-        super().__init__(mol, z, radii_table=radii_table,
-                         grid_level=grid_level, radial_grid_pts=radial_grid_pts)
+    def __init__(self, mol, z, radii_table, p_gpa=None, grid_level=3,
+                 lebedev_order=47):
+        super().__init__(mol, z, radii_table, grid_level=grid_level)
         self.p_gpa = p_gpa
         self.lebedev_order = int(lebedev_order)
 
     def get_e_cav(self, mol=None):
         """E_cav = pV in Hartree."""
-        mol = mol or self.mol
-        V = get_cavity_volume(
-            mol, radii_table=self.radii_table)
+        mol = mol if mol is not None else self.mol
+        V = get_cavity_volume(mol, self.radii_table)
         return V * self.p_gpa / EH_BOHR3_TO_GPA
 
-    def grad(self, dm):
+    def grad(self, dm, mol=None):
         """Nuclear gradient of (E_rep + E_cav), shape (natm, 3), Hartree/Bohr.
-        
+
         Computes three contributions:
         1. Cavitation:  dE_cav/dR_A = p · R_A^2 · 4π · Σ_l w_l n_{l,k}
         2. Boundary:    dE_rep/dR_A|_bnd = −z · R_A^2 · 4π · Σ_l w_l ρ_l n_{l,k}
         3. Volume:      z · d/dR Tr[P · S_out]
         """
+        mol = mol if mol is not None else self.mol
+        dm = _as_total_dm(dm)
         p_au = self.p_gpa / EH_BOHR3_TO_GPA  # pressure in atomic units
-        
+
         # Surface integrals (cavitation + boundary)
         surface_data = _get_cavity_surface_grid(
-            self.mol, radii_table=self.radii_table,
-            lebedev_order=self.lebedev_order)
-        
-        grad = np.zeros((self.mol.natm, 3))
-        for atom in range(self.mol.natm):
+            mol, self.radii_table, lebedev_order=self.lebedev_order)
+
+        grad = np.zeros((mol.natm, 3))
+        for atom in range(mol.natm):
             sd = surface_data[atom]
             R  = sd['radius']
             w  = sd['weights']
@@ -758,14 +883,13 @@ class _XPCav(_XP):
             
             # Boundary response of h_rep
             if len(sd['coords']) > 0:
-                ao  = dft.numint.eval_ao(self.mol, sd['coords'], deriv=0)
+                ao  = dft.numint.eval_ao(mol, sd['coords'], deriv=0)
                 rho = np.einsum('lm,lm->l', ao @ dm, ao)
                 grad[atom] -= self.z * prefactor * np.einsum('l,l,lk->k', w, rho, n)
-        
+
         # Volume-integral contribution from h_rep
         grad += self.z * _get_S_out_nuc_grad(
-            self.mol, dm, radii_table=self.radii_table,
-            grid_level=self.grid_level, radial_grid_pts=self.radial_grid_pts)
+            mol, dm, self.radii_table, grid_level=self.grid_level)
         
         return grad
 
@@ -839,21 +963,24 @@ class WithXPCavGrad:
     def kernel(self, *args, dm=None, **kwargs):
         if dm is None:
             dm = self.base.make_rdm1()
-        dm_tot = dm[0] + dm[1] if np.shape(dm)[0] == 2 else dm
+        dm_tot = _as_total_dm(dm)
 
-        # XPCav gradient: cavitation + boundary + volume
+        # XPCav gradient: cavitation + boundary + volume, for all atoms
         self.de_xp = self.base.with_xp.grad(dm_tot)
 
-        # Inner gradient (vanilla SCF, and/or PCM)
+        # Inner gradient (vanilla SCF, and/or PCM). GradientsBase.kernel records
+        # the atmlst it used on self.atmlst and returns (len(atmlst), 3).
         de_inner = super().kernel(*args, **kwargs)
 
-        self.de = de_inner + self.de_xp
+        de_xp = self.de_xp
+        if self.atmlst is not None:
+            de_xp = de_xp[np.asarray(self.atmlst)]
+        self.de = de_inner + de_xp
         return self.de
 
     grad = kernel
 
-def XPCav(mf, z, radii_table, p_gpa=None,
-          grid_level=3, lebedev_order=29, radial_grid_pts=1000):
+def XPCav(mf, z, radii_table, p_gpa=None, grid_level=3, lebedev_order=47):
     """
     Attach XPCav (Pauli repulsion + cavitation) to an SCF method
     for geometry optimisation under fixed pressure.
@@ -870,33 +997,42 @@ def XPCav(mf, z, radii_table, p_gpa=None,
     mf : pyscf.scf.SCF
         SCF object to wrap.
     z : float
-        Barrier height (Hartree).
+        Semi-empirical barrier height z (Hartree); see get_z0 and get_z.
     radii_table : array
         Pre-scaled cavity radii in Bohr, indexed by nuclear charge.
     p_gpa : float
         External pressure in GPa.
     grid_level : int, default 3
         PySCF grid level for volume and overlap integrals.
-    lebedev_order : int, default 29
-        Lebedev quadrature order for surface integrals (→ 302 points).
-    radial_grid_pts : int or None, default 1000
-        Number of radial grid points. If None, use grid_level default.
+    lebedev_order : int, default 47
+        Lebedev quadrature order for surface integrals (→ 770 points).
     
     Returns
     -------
     Modified SCF object with XPCav corrections (h_rep + e_cav) and gradients
+
+    Notes
+    -----
+    The exterior grid (_build_grid) is cut hard at the cavity surface, so the
+    repulsion energy is only piecewise smooth in the nuclear coordinates: as
+    nuclei move, points of one atom's shells cross another atom's sphere and
+    switch in or out of the integral. The analytical gradient is the derivative
+    of the underlying continuum expression and is essentially converged at
+    grid_level 3, but the energy carries grid noise.
+    For geometry optimisations use grid_level >= 5 and do not rely on
+    energy-based convergence criteria tighter than ~1e-6 Eh; converge on the
+    gradient and the step instead.
     """
     if p_gpa is None:
         raise ValueError("p_gpa (pressure in GPa) is required for XPCav")
-    
+
     if isinstance(mf, _SCFWithXP):
         raise ValueError(
             "Cannot attach XPCav to an object that already has XP.")
     
     with_xpcav = _XPCav(
-        mf.mol, z, radii_table=radii_table,
-        p_gpa=p_gpa, grid_level=grid_level, lebedev_order=lebedev_order,
-        radial_grid_pts=radial_grid_pts)
+        mf.mol, z, radii_table, p_gpa=p_gpa, grid_level=grid_level,
+        lebedev_order=lebedev_order)
     
     sol_mf = _SCFWithXPCav(mf, with_xpcav)
     name = 'XPCav' + mf.__class__.__name__
@@ -906,27 +1042,15 @@ def XPCav(mf, z, radii_table, p_gpa=None,
 #  Method-style convenience wrappers on SCF objects
 # ---------------------------------------------------------------------------
 
-def _xp_method(self, z, radii_table,
-               grid_level=3, radial_grid_pts=1000):
+def _xp_method(self, z, radii_table, grid_level=3):
     """Method-style XP wrapper: ks = ks.XP(...)."""
-    return XP(
-        self, z,
-        radii_table=radii_table,
-        grid_level=grid_level,
-        radial_grid_pts=radial_grid_pts
-    )
+    return XP(self, z, radii_table, grid_level=grid_level)
 
-def _xpcav_method(self, z, radii_table, p_gpa=None,
-                  grid_level=3, lebedev_order=29, radial_grid_pts=1000):
+def _xpcav_method(self, z, radii_table, p_gpa=None, grid_level=3,
+                  lebedev_order=47):
     """Method-style XPCav wrapper: ks = ks.XPCav(...)."""
-    return XPCav(
-        self, z,
-        radii_table=radii_table,
-        p_gpa=p_gpa,
-        grid_level=grid_level,
-        lebedev_order=lebedev_order,
-        radial_grid_pts=radial_grid_pts
-    )
+    return XPCav(self, z, radii_table, p_gpa=p_gpa, grid_level=grid_level,
+                 lebedev_order=lebedev_order)
 
 def _patch_scf_factory_methods():
     """Enable ks.XP(...) and ks.XPCav(...) on PySCF SCF/KS objects."""
@@ -940,14 +1064,20 @@ def _patch_scf_factory_methods():
     scf_hf.SCF._xppcm_factory_methods_patched = True
 
 # ---------------------------------------------------------------------------
-#  XP for post-HF (CCSD, CISD)
+#  XP for post-HF (CCSD, CISD, CASCI/CASSCF)
 # ---------------------------------------------------------------------------
 
 def _get_post_hf_dm_tot(method_obj):
     """Helper to compute the total AO density matrix from a post-HF method object."""
     mf = method_obj._scf
-    unrestricted = any(m in mf.__class__.__name__ for m in ('UHF', 'UKS'))
-    if unrestricted:
+    if isinstance(mf, scf.ghf.GHF):
+        raise NotImplementedError(
+            "XP for post-HF methods on a GHF reference is not supported.")
+    if isinstance(method_obj, mcscf.casci.CASBase):
+        # CASCI/CASSCF (and their solvent-decorated subclasses) return the
+        # AO-basis density, unlike CISD/CCSD which return the MO basis.
+        return _as_total_dm(method_obj.make_rdm1())
+    if isinstance(mf, scf.uhf.UHF):   # UKS is a subclass of UHF
         dm_mo_a, dm_mo_b = method_obj.make_rdm1()
         dm_a = np.einsum('pi,ij,qj->pq', method_obj.mo_coeff[0], dm_mo_a, method_obj.mo_coeff[0].conj())
         dm_b = np.einsum('pi,ij,qj->pq', method_obj.mo_coeff[1], dm_mo_b, method_obj.mo_coeff[1].conj())
@@ -957,44 +1087,73 @@ def _get_post_hf_dm_tot(method_obj):
         return np.einsum('pi,ij,qj->pq', method_obj.mo_coeff, dm_mo, method_obj.mo_coeff.conj())
 
 def _get_e_rep_post_hf(self, dm=None, mol=None):
-        """Computes the Pauli repulsion energy for a post-HF method with XP attached."""
-        if not hasattr(self, '_scf') or getattr(self._scf, 'with_xp', None) is None:
-            raise AttributeError("Underlying SCF object does not use XP-PCM.")
+    """Computes the Pauli repulsion energy for a post-HF method with XP attached."""
+    if not hasattr(self, '_scf') or getattr(self._scf, 'with_xp', None) is None:
+        raise AttributeError("Underlying SCF object does not use XP-PCM.")
 
-        mf = self._scf
-        xp_obj = mf.with_xp
-        mol = mol or self.mol
-        post_name = self.__class__.__name__
+    mf = self._scf
+    xp_obj = mf.with_xp
+    mol = mol if mol is not None else self.mol
+    if not isinstance(self, (ci.cisd.CISD, cc.ccsd.CCSDBase, mcscf.casci.CASBase)):
+        raise ValueError(
+            f"Post-HF method must be a CISD, CCSD, CASCI or CASSCF object. "
+            f"Found: {self.__class__.__name__}")
 
-        if not any(m in post_name for m in ('CISD', 'CCSD')):
-            raise ValueError(
-                f"Post-HF method must contain one of ('CISD', 'CCSD'). Found: {post_name}")
+    if dm is None: 
+        dm = _get_post_hf_dm_tot(self)
 
-        if dm is None: 
-            dm = _get_post_hf_dm_tot(self)
-
-        return xp_obj.get_e_rep(dm, mol=mol)
+    return xp_obj.get_e_rep(dm, mol=mol)
 
 def _patch_post_scf_kernel_for_xp(cls):
     """Patch a post-SCF class to allow get_e_rep access."""
-    # Allow direct access to .with_xp and .get_e_rep on post-HF objects
     if not hasattr(cls, 'with_xp'):
         setattr(cls, 'with_xp', property(lambda self: getattr(self._scf, 'with_xp', None)))
     if not hasattr(cls, 'get_e_rep'):
         setattr(cls, 'get_e_rep', _get_e_rep_post_hf)
  
 def _patch_post_scf_kernels_for_xp():
-    """Allow access to get_e_rep to supported post-SCF methods."""
+    """Allow get_e_rep access for supported post-SCF methods."""
+    #_patch_post_scf_kernel_for_xp(mp.mp2.MP2) # No MP2 because orbital relaxation too important for pressure.
+    #_patch_post_scf_kernel_for_xp(mp.ump2.UMP2)
     _patch_post_scf_kernel_for_xp(ci.cisd.CISD)
     _patch_post_scf_kernel_for_xp(ci.ucisd.UCISD)
     _patch_post_scf_kernel_for_xp(cc.ccsd.CCSD)
     _patch_post_scf_kernel_for_xp(cc.uccsd.UCCSD)
     _patch_post_scf_kernel_for_xp(cc.rccsd.RCCSD)
-    # CCSDT or higher not supported because cannot get DM.
+    _patch_post_scf_kernel_for_xp(mcscf.casci.CASBase)   # CASCI, CASSCF, FCI via CASCI(mf, nao, nelec)
+    # CCSDT or higher not natively supported because cannot get DM.
+
+def _patch_fci_factory_for_xp():
+    """
+    Warn when fci.FCI is built on an XP reference. The factory takes h_rep from
+    mf.get_hcore() but only mf.energy_nuc() for the constant, so any PCM is
+    silently dropped, and the returned solver has no _scf, so the pressure
+    cannot be evaluated from it. CASCI with every orbital active is the same
+    FCI and works with .PCM() and calculate_analytical_pressure.
+    """
+    if getattr(fci, '_xppcm_factory_patched', False):
+        return
+    _orig_FCI = fci.FCI
+
+    def FCI(mol_or_mf, *args, **kwargs):
+        if getattr(mol_or_mf, 'with_xp', None) is not None:
+            warnings.warn(
+                "fci.FCI(mf) on an XP reference includes the Pauli operator (via "
+                "mf.get_hcore()) but drops any PCM solvent, and its solver cannot be "
+                "passed to calculate_analytical_pressure. Use "
+                "mcscf.CASCI(mf, mf.mol.nao, mf.mol.nelec) instead (the same FCI; "
+                ".PCM() for a self-consistent PCM).",
+                UserWarning, stacklevel=2)
+        return _orig_FCI(mol_or_mf, *args, **kwargs)
+
+    FCI.__doc__ = _orig_FCI.__doc__
+    fci.FCI = FCI
+    fci._xppcm_factory_patched = True
 
 # ---------------------------------------------------------------------------
 # Patch at import time
 # ---------------------------------------------------------------------------
 
 _patch_post_scf_kernels_for_xp()
+_patch_fci_factory_for_xp()
 _patch_scf_factory_methods()
