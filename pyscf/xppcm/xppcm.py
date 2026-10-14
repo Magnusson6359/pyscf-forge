@@ -491,7 +491,7 @@ def _build_grid(mol, radii_table, grid_level=3):
     # but shells of other atoms cross this sphere and their points switch in and
     # out as the nuclei move, so the energy is only piecewise smooth in the
     # nuclear coordinates (noise ~1e-6 Eh at grid_level 3 for z ~ 0.3). The
-    # analytical gradient is the continuum limit and is unaffected. See XPCav().
+    # analytical gradient is the continuum limit and is unaffected.
     atom_coords = mol.atom_coords()
     inside = np.zeros(len(coords), dtype=bool)
     for ia in range(mol.natm):
@@ -503,8 +503,7 @@ def _build_grid(mol, radii_table, grid_level=3):
 def _xp_grid_blksize(mol, max_memory_mb=None):
     """
     Grid points per block for the exterior integrals, such that one (nblk, nao)
-    AO array takes about a third of the remaining memory budget (PySCF
-    convention: mol.max_memory minus current usage, floored at a minimum block).
+    AO array takes about a third of the remaining memory budget.
     """
     if max_memory_mb is None:
         max_memory_mb = max(mol.max_memory - lib.current_memory()[0], 0)
@@ -685,17 +684,7 @@ class _XP:
         self.grid_level = int(grid_level)
 
     def reset(self, mol=None):
-        """
-        Point this object at a new molecule.
-
-        Required because PySCF hands out a *new* Mole in several paths — most
-        importantly pyscf.geomopt, which optimises a copy of the molecule
-        (geomopt/geometric_solver.py: "To avoid overwriting method.mol"), and
-        grad.rhf.SCF_GradScanner, which calls set_geom_(..., inplace=False).
-        Without this, self.mol keeps the geometry it was constructed with and
-        every quantity computed from it (grad, get_e_cav) is silently evaluated
-        at the wrong geometry.
-        """
+        """Reset the object to a new molecule."""
         if mol is not None:
             self.mol = mol
         return self
@@ -706,7 +695,7 @@ class _XP:
         return _get_S_out(mol, self.radii_table, grid_level=self.grid_level) * self.z
 
     def get_e_rep(self, dm, mol=None):
-        """E_rep = z · Tr[P · S_out].  Handles restricted and unrestricted densities."""
+        """E_rep = z · Tr[P · S_out]."""
         mol = mol if mol is not None else self.mol
         dm_tot = _as_total_dm(dm)
         S_out = _get_S_out(mol, self.radii_table, grid_level=self.grid_level)
