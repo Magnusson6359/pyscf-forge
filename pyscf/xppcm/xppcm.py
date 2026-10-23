@@ -21,18 +21,20 @@ import numpy as np
 import warnings
 from scipy.optimize import curve_fit
 from pyscf import lib, scf, dft, gto, ci, cc, mcscf, fci
-from pyscf.data import radii
+from pyscf.lib.parameters import BOHR
+from pyscf.data.radii import VDW
 from pyscf.dft.gen_grid import MakeAngularGrid, LEBEDEV_ORDER, _default_ang, _default_rad, get_partition
 from .pcm_derivatives import get_pcm_obj, pol_derivatives
 from .analytical_cavity import union_of_spheres_volume
+from .radii import RAHM
 
 # AU pressure conversion factor: 1 Eh/Bohr^3 = 29421.015798 GPa
 EH_BOHR3_TO_GPA = 29421.015798
 
-Rahm = radii.RAHM.copy()
-Vdw  = radii.VDW.copy()
+Rahm = RAHM.copy()
+Vdw  = VDW.copy()
 Mod_Bondi = Vdw.copy()
-Mod_Bondi[1] = 1.1 / radii.BOHR
+Mod_Bondi[1] = 1.1 / BOHR
 
 # ---------------------------------------------------------------------------
 #  Public helpers

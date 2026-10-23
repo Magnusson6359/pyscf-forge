@@ -1,24 +1,25 @@
-# pyscf-forge/pyscf/xppcm/__init__.py
-"""
-XP-PCM module for pyscf-forge
-"""
+#!/usr/bin/env python
+# Copyright 2014-2026 The PySCF Developers. All Rights Reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 
-import importlib.util
-import sys
-from pathlib import Path
+'''
+XP-PCM: eXtreme-Pressure Polarizable Continuum Model
 
-import pyscf.data as _pyscf_data
+Pauli repulsion (XP) and cavitation (XPCav) decorators for SCF objects,
+analytical XP-PCM pressures for SCF and post-HF methods, and the cavity
+volume and PCM derivative helpers they rely on.
+'''
 
-def _load_local_module(module_name, relative_path):
-	module_path = Path(__file__).resolve().parents[1] / relative_path
-	spec = importlib.util.spec_from_file_location(module_name, module_path)
-	if spec is None or spec.loader is None:
-		raise ImportError(f"Cannot load {module_name} from {module_path}")
-
-	module = importlib.util.module_from_spec(spec)
-	sys.modules[module_name] = module
-	spec.loader.exec_module(module)
-	return module
-
-_pyscf_data.radii = _load_local_module('pyscf.data.radii', 'data/radii.py') # Temp solution
 from .xppcm import *
