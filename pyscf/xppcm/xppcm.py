@@ -1,5 +1,5 @@
 '''
-XPPCM module for PySCF.
+XP-PCM (eXtreme-Pressure Polarizable Continuum Model) for PySCF.
 '''
 
 # ---------------------------------------------------------------------------
@@ -148,7 +148,7 @@ def calculate_fitted_pressure(energies, volumes):
     a = a_fit / volumes[0]
     b = b_fit
     c = c_fit / volumes[0]
-    
+
     v_ratio = volumes[0] / volumes
     return (a * (v_ratio ** (b + 1) - 1) + c) * EH_BOHR3_TO_GPA
 
@@ -450,7 +450,7 @@ def _build_grid(mol, radii_table, grid_level=3):
 
     Each atom's radial shells (Treutler-Ahlrichs) start at that
     atom's cavity radius, and the atoms are joined by Becke weights.
-    Points that fall inside another atom's sphere are removed. Angular pruning is not applied. 
+    Points that fall inside another atom's sphere are removed. Angular pruning is not applied.
     This grid is used only for the XP-PCM integrals, not for the DFT part when using a DFT functional.
     # TODO: Radius fitting support in the future!
 
@@ -717,7 +717,7 @@ class _SCFWithXP:
     def radii_table(self):
         """Expose radii_table for PCM compatibility."""
         return self.with_xp.radii_table
-    
+
     @radii_table.setter
     def radii_table(self, value):
         """Allow setting radii_table for PCM compatibility."""
@@ -771,12 +771,12 @@ class _SCFWithXP:
 def XP(mf, z, radii_table, grid_level=3):
     """
     Attach XP (Pauli repulsion only) to an SCF method.
-    
+
     Usage:
         ks = dft.RKS(mol)
         ks_xp = XP(ks, z=0.5, radii_table=Vdw)
         ks_xp.kernel()
-    
+
     Parameters
     ----------
     mf : pyscf.scf.SCF
@@ -787,7 +787,7 @@ def XP(mf, z, radii_table, grid_level=3):
         Pre-scaled cavity radii in Bohr, indexed by nuclear charge.
     grid_level : int, default 3
         PySCF grid level for XP integrals.
-    
+
     Returns
     -------
     Modified SCF object with XP Hamiltonian correction
@@ -867,11 +867,11 @@ class _XPCav(_XP):
             w  = sd['weights']
             n  = sd['normals']
             prefactor = R**2 * 4.0 * np.pi
-            
+
             # Cavitation: p · dV/dR_A
             wn = np.einsum('l,lk->k', w, n)
             grad[atom] += p_au * prefactor * wn
-            
+
             # Boundary response of h_rep
             if len(sd['coords']) > 0:
                 ao  = dft.numint.eval_ao(mol, sd['coords'], deriv=0)
@@ -881,12 +881,12 @@ class _XPCav(_XP):
         # Volume-integral contribution from h_rep
         grad += self.z * _get_S_out_nuc_grad(
             mol, dm, self.radii_table, grid_level=self.grid_level)
-        
+
         return grad
 
 class _SCFWithXPCav(_SCFWithXP):
     """
-    SCF wrapper that includes both repulsion and cavitation contributions,  
+    SCF wrapper that includes both repulsion and cavitation contributions,
     along with analytical gradients for geometry optimisation under fixed pressure.
     """
 
@@ -975,14 +975,14 @@ def XPCav(mf, z, radii_table, p_gpa=None, grid_level=3, lebedev_order=47):
     """
     Attach XPCav (Pauli repulsion + cavitation) to an SCF method
     for geometry optimisation under fixed pressure.
-    
+
     Usage:
         ks = dft.RKS(mol)
         ks_xpcav = XPCav(ks, z=0.5, radii_table=Rahm, p_gpa=0.1)
         ks_xpcav.kernel()  # SCF
         grad_solver = ks_xpcav.nuc_grad_method()  # Get gradient solver
         grad_solver.kernel()  # Compute gradients
-    
+
     Parameters
     ----------
     mf : pyscf.scf.SCF
@@ -997,7 +997,7 @@ def XPCav(mf, z, radii_table, p_gpa=None, grid_level=3, lebedev_order=47):
         PySCF grid level for volume and overlap integrals.
     lebedev_order : int, default 47
         Lebedev quadrature order for surface integrals (→ 770 points).
-    
+
     Returns
     -------
     Modified SCF object with XPCav corrections (h_rep + e_cav) and gradients
@@ -1020,11 +1020,11 @@ def XPCav(mf, z, radii_table, p_gpa=None, grid_level=3, lebedev_order=47):
     if isinstance(mf, _SCFWithXP):
         raise ValueError(
             "Cannot attach XPCav to an object that already has XP.")
-    
+
     with_xpcav = _XPCav(
         mf.mol, z, radii_table, p_gpa=p_gpa, grid_level=grid_level,
         lebedev_order=lebedev_order)
-    
+
     sol_mf = _SCFWithXPCav(mf, with_xpcav)
     name = 'XPCav' + mf.__class__.__name__
     return lib.set_class(sol_mf, (_SCFWithXPCav, mf.__class__), name)
@@ -1090,7 +1090,7 @@ def _get_e_rep_post_hf(self, dm=None, mol=None):
             f"Post-HF method must be a CISD, CCSD, CASCI or CASSCF object. "
             f"Found: {self.__class__.__name__}")
 
-    if dm is None: 
+    if dm is None:
         dm = _get_post_hf_dm_tot(self)
 
     return xp_obj.get_e_rep(dm, mol=mol)
@@ -1101,7 +1101,7 @@ def _patch_post_scf_kernel_for_xp(cls):
         setattr(cls, 'with_xp', property(lambda self: getattr(self._scf, 'with_xp', None)))
     if not hasattr(cls, 'get_e_rep'):
         setattr(cls, 'get_e_rep', _get_e_rep_post_hf)
- 
+
 def _patch_post_scf_kernels_for_xp():
     """Allow get_e_rep access for supported post-SCF methods."""
     #_patch_post_scf_kernel_for_xp(mp.mp2.MP2) # No MP2 because orbital relaxation too important for pressure.

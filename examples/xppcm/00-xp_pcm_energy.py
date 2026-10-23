@@ -7,7 +7,7 @@
 XP-PCM (eXtreme-Pressure Polarizable Continuum Model) single-point energies.
 
 The XP-PCM model extends the standard PCM model with a Pauli repulsion term
-E_rep = z Tr(P S_out), where S_out is the overlap of the basis functions 
+E_rep = z Tr(P S_out), where S_out is the overlap of the basis functions
 evaluated outside the  cavity and z is a semi-empirical barrier height.
 
 This example attaches the Pauli repulsion to a KS object with .XP() and,

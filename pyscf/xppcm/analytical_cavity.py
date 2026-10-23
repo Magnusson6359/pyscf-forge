@@ -31,11 +31,11 @@ def union_of_spheres_volume(coords, radii):
         raise ValueError("All radii must be positive.")
 
     total_volume = 0.0
-    
+
     for i in range(len(coords)): # For each atom i:
         # Get radical planes between atom i and all other atoms
         rad_planes = _get_radical_planes(coords, radii, i)
-        
+
         # Add bounding box around atom i to ensure a closed region for HalfspaceIntersection.
         c_i = coords[i]
         r_i = radii[i]
@@ -51,7 +51,7 @@ def union_of_spheres_volume(coords, radii):
             all_halfspaces = np.vstack([rad_planes, bbox_planes])
         else:
             all_halfspaces = bbox_planes
-            
+
         # Find an interior point of C_i using scipy.linprog
         norm_A = np.linalg.norm(all_halfspaces[:, :3], axis=1)
         A_lp = np.hstack([all_halfspaces[:, :3], norm_A[:, None]])
@@ -63,16 +63,16 @@ def union_of_spheres_volume(coords, radii):
             # Atom i is completely swallowed by others, C_i is empty.
             continue
         interior_point = res.x[:3]
-        
+
         # Get C_i (the convex polyhedron for atom i)
         try: # Catch Qhull errors if C_i degenerate
             convex_polyhedron = HalfspaceIntersection(all_halfspaces, interior_point)
-            
+
             # Extract the planar faces of C_i
             planar_faces = _extract_planar_faces(convex_polyhedron)
             c_i = coords[i]
             r_i = radii[i]
-            
+
             # Compute planar face volume contribution (and solid angle)
             C_i_volume = 0.0
             omega_P_total = 0.0
@@ -95,12 +95,13 @@ def union_of_spheres_volume(coords, radii):
                 # Compute the area and solid angle of the intersection of the planar face with its boundary circle
                 area_P, omega_P = _polygon_circle_intersection_area_and_solid_angle(verts_2d, R_circle, -signed_h, r_i)
                 omega_P_total += omega_P
-                
+
                 # Volume contribution for the planar faces (generalised pyramid formula)
                 C_i_volume += (-signed_h * area_P) / 3.0
-                
+
             # Spherical cap contribution
-            # Motivation: The total solid angle of C_i is 4pi, so 4pi-omega_P_total is the solid angle of the (total) spherical cap.
+            # Motivation: the total solid angle of C_i is 4pi, so 4pi - omega_P_total
+            # is the solid angle of the (total) spherical cap.
             # "Everything not a planar face is a spherical cap"
             # Normalised by norm_A so the tolerance is a real distance.
             signed_dists = (all_halfspaces[:, :3] @ c_i + all_halfspaces[:, 3]) / norm_A
@@ -111,7 +112,7 @@ def union_of_spheres_volume(coords, radii):
             C_i_volume += (r_i * area_S_exact) / 3.0
             # Total contribution from atom i:
             total_volume += C_i_volume
-            
+
         except QhullError as e:
             # Almost empty or degenerate cell, skip this atom
             warnings.warn(
@@ -124,7 +125,8 @@ def union_of_spheres_volume(coords, radii):
 def _solid_angle_triangle(R1, R2, R3):
     """
     Computes the solid angle subtended by the triangle formed by R1, R2, R3 at the origin.
-    From Van Oosterom and Strackee, "The Solid Angle of a Plane Triangle", IEEE Transactions on Biomedical Engineering, 1983.
+    From Van Oosterom and Strackee, "The Solid Angle of a Plane Triangle",
+    IEEE Transactions on Biomedical Engineering, 1983.
     """
     r1 = np.linalg.norm(R1)
     r2 = np.linalg.norm(R2)
@@ -135,22 +137,22 @@ def _solid_angle_triangle(R1, R2, R3):
 
 def _segment_circle_intersection_area_and_solid_angle(A, B, R, h, r_i):
     """
-    Computes both the area and the exact solid angle of the intersection of 
+    Computes both the area and the exact solid angle of the intersection of
     a triangle (Origin, A, B) and a circle of radius R centered at the origin.
     """
     # Check if A and B are collinear with the origin (degenerate triangle)
     if np.isclose(A[0]*B[1] - A[1]*B[0], 0):
         return 0.0, 0.0
 
-    # Set up the quadratic for line-circle intersection  
+    # Set up the quadratic for line-circle intersection
     D = B - A
     a_coef = np.dot(D, D)
     b_coef = 2 * np.dot(A, D)
     c_coef = np.dot(A, A) - R**2
-    
+
     # discriminant for intersection
     disc = b_coef**2 - 4*a_coef*c_coef
-    
+
     # Solve for t values of intersection points, only consider those strictly between A and B (0 < t < 1)
     t_roots = []
     if disc > 0 and not np.isclose(a_coef, 0):
@@ -160,15 +162,15 @@ def _segment_circle_intersection_area_and_solid_angle(A, B, R, h, r_i):
         t_roots.extend([t for t in (t1, t2) if 0 < t < 1])
     t_roots = sorted(t_roots)
     pts = [A] + [A + t*D for t in t_roots] + [B] # Points along the segment in order
-    
+
     area = 0.0
     omega = 0.0
     for i in range(len(pts) - 1): # For each segment between consecutive points
         p1 = pts[i]
         p2 = pts[i+1]
-        
+
         mid = (p1 + p2) / 2
-        
+
         if np.linalg.norm(mid) <= R:
             # Segment is inside the circle: triangle area via shoelace formula
             area += 0.5 * (p1[0]*p2[1] - p1[1]*p2[0])
@@ -183,12 +185,12 @@ def _segment_circle_intersection_area_and_solid_angle(A, B, R, h, r_i):
             d_theta = (theta2 - theta1 + np.pi) % (2*np.pi) - np.pi
             area += 0.5 * R**2 * d_theta
             omega += d_theta * (np.sign(h) - h / r_i)
-            
+
     return area, omega
 
 def _polygon_circle_intersection_area_and_solid_angle(verts_2d, R, h, r_i):
     """
-    Finds the exact intersection area and solid angle between an arbitrary 
+    Finds the exact intersection area and solid angle between an arbitrary
     2D polygon and a circle of radius R centered at the origin.
     """
     area_total = 0.0
@@ -200,7 +202,7 @@ def _polygon_circle_intersection_area_and_solid_angle(verts_2d, R, h, r_i):
         a, o = _segment_circle_intersection_area_and_solid_angle(A, B, R, h, r_i)
         area_total += a
         omega_total += o
-        
+
     # The vertices run counter-clockwise in the (u, v) frame, so area_total comes
     # out positive. The solid angle carries that same orientation, so should the
     # sign ever flip, both must flip together.
@@ -214,32 +216,32 @@ def _extract_planar_faces(convex_polyhedrons, tol=1e-8):
     """
     vertices = convex_polyhedrons.intersections # vertices of the polyhedron
     halfspaces = convex_polyhedrons.halfspaces # radical planes + bounding box planes
-    
+
     faces = []
     seen = [] # Planes already made into a face, so none is counted twice
     for h in halfspaces:
         h_norm = np.linalg.norm(h[:3])
         if h_norm <= 0.0:
             continue # Degenerate halfspace, defines no plane
-        
+
         normal = h[:3] / h_norm
         d = h[3] / h_norm
-        
+
         # Check if this plane has already been processed (within tolerance)
         if any(np.abs(normal - n_prev).max() <= tol and abs(d - d_prev) <= tol
                for n_prev, d_prev in seen):
             continue
         seen.append((normal, d))
-        
+
         # Check distance of all vertices to radical plane
         dists = np.dot(vertices, normal) + d
-        
+
         # Vertices lying on the plane
         on_plane_idx = np.where(np.abs(dists) <= tol)[0]
-        
+
         if len(on_plane_idx) >= 3: # At least 3 vertices needed to define a face
             face_verts = vertices[on_plane_idx]
-            
+
             # Order the vertices in the plane of the face by projecting to 2D and using Convex Hull
             u, v = _get_orthogonal_basis_for_plane(normal)
 
@@ -252,20 +254,20 @@ def _extract_planar_faces(convex_polyhedrons, tol=1e-8):
             except QhullError:
                 continue # Degenerate (e.g. collinear) face, contributes no area
             ordered_verts = face_verts[hull_2d.vertices]
-            
+
             faces.append({
                 'normal': normal,
                 'd': d,
                 'vertices': ordered_verts
             })
-            
+
     return faces
 
 def _get_radical_planes(coords, radii, i):
     """
     Construct the radical planes for the i-th sphere
     against all other spheres j in a power diagram.
-    
+
     For two spheres i and j, the power distances to a point x are equal when:
     ||x - c_i||^2 - r_i^2 = ||x - c_j||^2 - r_j^2
     This simplifies to a plane equation: 2(c_j - c_i) * x + (||c_i||^2 - ||c_j||^2 - r_i^2 + r_j^2) = 0
@@ -273,22 +275,22 @@ def _get_radical_planes(coords, radii, i):
     N = len(coords)
     c_i = coords[i]
     r_i = radii[i]
-    
+
     rad_planes = []
-    
+
     for j in range(N):
         if i == j:
             continue
-            
+
         c_j = coords[j]
         r_j = radii[j]
-        
+
         # Power Diagram Plane: 2*(c_j - c_i)*x + (||c_i||^2 - ||c_j||^2 - r_i^2 + r_j^2) = 0
         normal = 2.0 * (c_j - c_i)
-        
+
         c_i_2 = np.dot(c_i, c_i)
         c_j_2 = np.dot(c_j, c_j)
-        
+
         d = (c_i_2 - c_j_2) - (r_i**2 - r_j**2)
 
         # Check if spheres are coincident or if the radical plane is degenerate
@@ -297,9 +299,9 @@ def _get_radical_planes(coords, radii, i):
                 return np.array([[0.0, 0.0, 0.0, 1.0]]) # Infeasible => C_i empty
             continue # Sphere j constrains nothing
 
-        # Format Ax + By + Cz + D <= 0 for HalfspaceIntersection  
+        # Format Ax + By + Cz + D <= 0 for HalfspaceIntersection
         rad_planes.append([normal[0], normal[1], normal[2], d])
-        
+
     return np.array(rad_planes)
 
 def _get_orthogonal_basis_for_plane(normal):
@@ -310,9 +312,9 @@ def _get_orthogonal_basis_for_plane(normal):
         ref = np.array([1.0, 0.0, 0.0])
     else:
         ref = np.array([0.0, 1.0, 0.0])
-        
+
     u = np.cross(normal, ref)
     u /= np.linalg.norm(u)
     v = np.cross(normal, u)
-    
+
     return u, v

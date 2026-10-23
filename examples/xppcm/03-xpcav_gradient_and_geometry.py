@@ -25,7 +25,7 @@ from pyscf.xppcm import Rahm, get_cavity_volume
 radii = Rahm * 0.90
 z = 0.30          # barrier height (Hartree)
 p_gpa = 10.0      # external pressure (GPa)
-# These values are for demonstration only. Really, z and p_gpa should be derived from the cavity volume 
+# These values are for demonstration only. Really, z and p_gpa should be derived from the cavity volume
 # with get_z and calculate_analytical_pressure, see 01-pressure_from_volume_scan.py. Therefore one would
 # need an outer loop to converge on the pressure/geometry, which is not shown here.
 
