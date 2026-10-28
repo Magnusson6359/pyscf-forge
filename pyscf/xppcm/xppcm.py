@@ -230,7 +230,7 @@ def calculate_analytical_pressure(method_obj, volume_cavity, eta=6, lebedev_orde
     eta : float, default 6
         Repulsive exponent.
     lebedev_order : int, default 89
-        Lebedev quadrature order for surface grids (89 = 3470 points per sphere).
+        Lebedev quadrature order for surface grids (89 = 2702 points per sphere).
     polarisation : bool, default True
         Include the PCM polarisation terms when a PCM solvent is attached.
         Ignored if no PCM is attached.
@@ -639,7 +639,7 @@ def _get_cavity_surface_grid(mol, radii_table, lebedev_order=89):
     radii_table : array
         Cavity radii in Bohr, indexed by nuclear charge.
     lebedev_order : int, default 89
-        Order of the Lebedev grid (89 = 3470 points per sphere).
+        Order of the Lebedev grid (89 = 2702 points per sphere).
 
     Returns
     -------
@@ -897,7 +897,7 @@ class _XPCav(_XP):
     grid_level : int, default 3
         PySCF grid level for volume and overlap integrals.
     lebedev_order : int, default 89
-        Lebedev quadrature order for surface integrals (89 = 3470 points per sphere).
+        Lebedev quadrature order for surface integrals (89 = 2702 points per sphere).
     """
 
     def __init__(self, mol, z, radii_table, p_gpa=None, grid_level=3,
@@ -1078,7 +1078,7 @@ def XPCav(mf, z, radii_table, p_gpa=None, grid_level=3, lebedev_order=89):
     grid_level : int, default 3
         PySCF grid level for volume and overlap integrals.
     lebedev_order : int, default 89
-        Lebedev quadrature order for surface integrals (89 = 3470 points per sphere).
+        Lebedev quadrature order for surface integrals (89 = 2702 points per sphere).
 
     Returns
     -------
