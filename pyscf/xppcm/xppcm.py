@@ -35,6 +35,8 @@ XP-PCM (eXtreme-Pressure Polarizable Continuum Model) for PySCF.
 # calculate_analytical_pressure: compute pressure analytically
 # get_cavity_volume_atom: compute cavity volume for a single atom
 # get_cavity_volume: compute cavity volume
+# augment_basis: add even-tempered shells where the orbitals bend at the cavity wall
+# (standard basis sets cannot, the error grows with the barrier height)
 
 import numpy as np
 import warnings
@@ -432,8 +434,108 @@ def get_e_rep(method_obj, dm=None, mol=None):
     return xp.get_e_rep(dm, mol=mol if mol is not None else method_obj.mol)
 
 # ---------------------------------------------------------------------------
+#  Basis-set augmentation for high Z
+# ---------------------------------------------------------------------------
+
+def augment_basis(mol, z, radii_table, n=6, window=4.0, l_max=1, grid_level=3, verbose=None):
+    """
+    Extends mol with even-tempered shells added where the orbitals bend at the
+    cavity wall. Standard basis sets cannot bend there, and their error grows
+    with the barrier height.
+
+    Outside the wall an orbital decays as exp(-kappa r) with kappa = sqrt(2 z);
+    the Gaussian that matches this slope at the sphere of radius R_A has the
+    exponent a* = kappa / (2 R_A). The added shells span a*/window ... a* window
+    for every element, skipping exponents the base set already has and
+    exponents the exterior grid cannot see (_grid_min_exponent).
+
+    Parameters
+    ----------
+    mol : gto.Mole
+        Molecule with the base basis set.
+    z : float
+        Barrier height (Hartree), as passed to XP.
+    radii_table : array
+        Scaled cavity radii in Bohr, indexed by nuclear charge, as passed to XP.
+    n : int, default 6
+        Exponents per angular momentum across the window.
+    window : float, default 4
+        Half-width of the window in exponent space, as a factor of a*.
+    l_max : int, default 1
+        Highest angular momentum added (0 is enough for s-block atoms).
+    grid_level : int, default 3
+        PySCF grid level of the XP calculation.
+    verbose : int, optional
+        Log level (default: mol.verbose). The added shells are reported at NOTE level.
+
+    Returns
+    -------
+    gto.Mole
+        New molecule object with the augmented basis.
+    """
+    added, dropped = _wall_shells(mol, z, radii_table, n, window, l_max, grid_level)
+    basis = {key: list(shells) for key, shells in mol._basis.items()}
+    for key, per_l in added.items():
+        basis[key] = basis[key] + [[l, [a, 1.0]] for l, exps in per_l.items() for a in exps]
+    new = mol.copy()
+    new.basis = basis
+    new.build(dump_input=False, parse_arg=False)
+    log = lib.logger.new_logger(new, verbose)
+    for key, per_l in added.items():
+        parts = []
+        for l, exps in per_l.items():
+            parts.append(f"+{len(exps)} {'spdfgh'[l]}"
+                         + (f" ({min(exps):.3g}-{max(exps):.3g})" if exps else ''))
+        if dropped[key]:
+            parts.append(f"{dropped[key]} exponent{'s' if dropped[key] > 1 else ''} "
+                         f"below the grid reach dropped")
+        log.note('augment_basis: %-3s %s', key + ':', ',  '.join(parts))
+    log.note('augment_basis: nao %d -> %d', mol.nao, new.nao)
+    return new
+
+# ---------------------------------------------------------------------------
 #  Internal helpers
 # ---------------------------------------------------------------------------
+
+def _wall_shells(mol, z, radii_table, n=6, window=4.0, l_max=1, grid_level=3):
+    """
+    Exponents augment_basis adds.
+
+    Parameters
+    ----------
+    See augment_basis.
+
+    Returns
+    -------
+    added : dict
+        {basis key: {l: [exponents]}}, one entry per key of mol._basis.
+    dropped : dict
+        {basis key: number of window exponents below the reach of the exterior grid}.
+    """
+    radii = _get_cavity_radii(mol, radii_table)
+    spacing = window ** (2.0 / (n - 1))               # n exponents across the window
+    added, dropped = {}, {}
+    for ia in range(mol.natm):
+        # The key this atom's basis has in mol._basis: its own label ('H1') if
+        # the basis was given per label, otherwise the element. Atoms sharing a
+        # key share the element, hence the radius and the shells.
+        key = mol.atom_symbol(ia)
+        if key not in mol._basis:
+            key = mol.atom_pure_symbol(ia)
+        if key in added:
+            continue
+        chg = gto.charge(mol.atom_symbol(ia))         # nuclear charge, as in _build_grid
+        a_star = np.sqrt(2.0 * z) / (2.0 * radii[ia])
+        floor = _grid_min_exponent(chg, grid_level)
+        exps = [a_star / window * spacing ** k for k in range(n)]
+        dropped[key] = sum(a < floor for a in exps)
+        exps = [a for a in exps if a >= floor]
+        added[key] = {}
+        for l in range(l_max + 1):
+            have = [p[0] for sh in mol._basis[key] if sh[0] == l for p in sh[1:]]
+            added[key][l] = [a for a in exps
+                             if not any(a / np.sqrt(spacing) < h < a * np.sqrt(spacing) for h in have)]
+    return added, dropped
 
 def _get_scaling_factor(volume, volume_0):
     """
@@ -505,6 +607,17 @@ class _PerAtomKeys:
     def atom_symbol(self, ia):
         return ia
 
+def _grid_reach(chg, grid_level=3):
+    """Reach in Bohr of an atom's exterior shells beyond its cavity surface."""
+    return dft.radi.treutler_ahlrichs(_default_rad(chg, grid_level), chg)[0][-1]
+
+def _grid_min_exponent(chg, grid_level=3):
+    """
+    Smallest Gaussian exponent (Bohr^-2) whose density beyond the reach of the
+    exterior grid is below 1e-3 of its norm: exp(-2 a reach^2) = 1e-3.
+    """
+    return np.log(1e3) / (2.0 * _grid_reach(chg, grid_level)**2)
+
 def _build_grid(mol, radii_table, grid_level=3):
     """
     Build the exterior grid for the XP-PCM integrals: all points outside the
@@ -541,6 +654,16 @@ def _build_grid(mol, radii_table, grid_level=3):
         n_rad = _default_rad(chg, grid_level)
         n_ang = _default_ang(chg, level=grid_level)
         rad, dr = dft.radi.treutler_ahlrichs(n_rad, chg)
+        a_safe = _grid_min_exponent(chg, grid_level)
+        a_min = min(mol.bas_exp(i).min() for i in range(mol.nbas) if mol.bas_atom(i) == ia)
+        if a_min < a_safe:
+            warnings.warn(
+                f"XP-PCM exterior grid reaches {rad[-1]:.0f} Bohr beyond the cavity sphere "
+                f"of atom {ia} ({mol.atom_symbol(ia)}), but its basis has exponents down to "
+                f"{a_min:.1e} Bohr^-2, which leave more than 1e-3 of their density beyond "
+                f"the grid. Their density outside the cavity is underestimated, and at a "
+                f"high barrier the SCF can place electrons beyond the grid. Drop exponents "
+                f"below {a_safe:.1e} Bohr^-2 or raise grid_level.", UserWarning, stacklevel=3)
         rad = rad + radii[ia]
         ang = MakeAngularGrid(n_ang)                      # (n_ang, 4): x, y, z, w
         coords = np.einsum('i,jk->ijk', rad, ang[:, :3]).reshape(-1, 3)

@@ -27,5 +27,6 @@ from .xppcm import (
     get_e_rep, get_z0, get_z, get_eps,
     calculate_fitted_pressure, calculate_numerical_pressure, calculate_analytical_pressure,
     get_cavity_volume, get_cavity_volume_atom,
+    augment_basis,
     Rahm, Vdw, Mod_Bondi,
 )
